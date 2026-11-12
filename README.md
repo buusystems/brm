@@ -199,9 +199,10 @@ A handler receives an `Event`:
    marked **dead**. Dead jobs stay in the table with their event and last error, are passed
    to `App(on_error=...)`, and can be requeued with `app.outbox.requeue()` or
    `POST /_brm/outbox/requeue`.
-5. If a dispatcher dies mid-job, its lease runs out and another dispatcher claims the job
-   again. A job that keeps killing its dispatcher is marked dead once it runs out of
-   attempts.
+5. If a dispatcher dies mid-job, its lease runs out and another dispatcher (or the same
+   one after a restart) claims the job again. A crash does not use up `retries`. A job
+   whose runs keep dying is marked dead after `App(max_reclaims=3)` takeovers, so one
+   handler that crashes the process cannot take the queue down with it.
 
 **Delivery is at-least-once, so make handlers idempotent.** For example, use
 `ev.change.key` together with `ev.change.op` as a deduplication key downstream.

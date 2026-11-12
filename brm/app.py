@@ -32,7 +32,8 @@ class App:
     so they survive crashes and are delivered at least once. ``dispatch=False`` makes
     a process that only writes, and leaves running handlers to other processes on the
     same database file. ``lease`` is how long a claimed job may run before another
-    dispatcher may take it over.
+    dispatcher may take it over; a job taken over more than ``max_reclaims`` times
+    (its runs keep dying) is marked dead. Crashes do not use up ``retries``.
     """
 
     def __init__(
@@ -46,6 +47,7 @@ class App:
         dispatch: bool = True,
         poll: float = 0.25,
         lease: float = 60.0,
+        max_reclaims: int = 3,
         title: str = "brm",
     ):
         if order not in ("bfs", "dfs"):
@@ -56,7 +58,8 @@ class App:
         self.outbox = Outbox(self.store)
         self.store.outbox = self.outbox
         self.dispatcher = Dispatcher(self.outbox, self.registry, concurrency=concurrency,
-                                     on_error=on_error, poll=poll, lease=lease)
+                                     on_error=on_error, poll=poll, lease=lease,
+                                     max_reclaims=max_reclaims)
         self.store.on_commit = self.dispatcher.wake
         if dispatch:
             self.dispatcher.start()

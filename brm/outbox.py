@@ -36,7 +36,8 @@ CREATE TABLE IF NOT EXISTS _brm_outbox (
     handler       TEXT    NOT NULL,
     event         TEXT    NOT NULL,          -- Event as JSON
     status        TEXT    NOT NULL DEFAULT 'pending',  -- pending | running | dead
-    attempts      INTEGER NOT NULL DEFAULT 0,
+    attempts      INTEGER NOT NULL DEFAULT 0,  -- times started
+    reclaims      INTEGER NOT NULL DEFAULT 0,  -- times taken over after a lease expired
     not_before    REAL    NOT NULL,          -- unix time the job may next run
     claimed_by    TEXT,
     claimed_until REAL,                      -- lease expiry while running
@@ -53,7 +54,13 @@ class Job:
     id: int
     handler: str
     event: Event
-    attempts: int
+    attempts: int  # times started, this one included
+    reclaims: int  # of those, starts after an earlier run's lease expired (a crash)
+
+    @property
+    def errors(self) -> int:
+        """Earlier attempts that ended in a handler error."""
+        return self.attempts - 1 - self.reclaims
 
 
 @dataclass
@@ -92,17 +99,18 @@ class Outbox:
         marks = ",".join("?" for _ in names)
         rows = self._x(
             f"""UPDATE _brm_outbox
-                SET status = 'running', claimed_by = ?, claimed_until = ?, attempts = attempts + 1
+                SET reclaims = reclaims + (status = 'running'),
+                    status = 'running', claimed_by = ?, claimed_until = ?, attempts = attempts + 1
                 WHERE id IN (
                     SELECT id FROM _brm_outbox
                     WHERE handler IN ({marks})
                       AND ((status = 'pending' AND not_before <= ?)
                            OR (status = 'running' AND claimed_until < ?))
                     ORDER BY id LIMIT ?)
-                RETURNING id, handler, event, attempts""",
+                RETURNING id, handler, event, attempts, reclaims""",
             [me, now + lease, *names, now, now, n],
         )
-        return sorted((Job(r[0], r[1], Event.loads(r[2]), r[3]) for r in rows), key=lambda j: j.id)
+        return sorted((Job(r[0], r[1], Event.loads(r[2]), r[3], r[4]) for r in rows), key=lambda j: j.id)
 
     def done(self, job: Job, me: str) -> None:
         self._x("DELETE FROM _brm_outbox WHERE id = ? AND claimed_by = ?", (job.id, me))
@@ -167,7 +175,7 @@ class Outbox:
 
     def requeue(self, ids: list[int] | None = None, handler: str | None = None) -> int:
         """Put dead jobs back in the queue with fresh attempts. Returns how many."""
-        sql = ("UPDATE _brm_outbox SET status = 'pending', attempts = 0, not_before = ?, finished = NULL "
+        sql = ("UPDATE _brm_outbox SET status = 'pending', attempts = 0, reclaims = 0, not_before = ?, finished = NULL "
                "WHERE status = 'dead'")
         args: list = [time.time()]
         if ids is not None:
@@ -204,7 +212,7 @@ class Dispatcher:
 
     def __init__(self, outbox: Outbox, registry: Registry, *, concurrency: int = 1,
                  on_error: Callable[[Failure], Any] | None = None, poll: float = 0.25,
-                 lease: float = 60.0, batch: int = 32):
+                 lease: float = 60.0, batch: int = 32, max_reclaims: int = 3):
         self.outbox = outbox
         self.registry = registry
         self.concurrency = concurrency
@@ -212,6 +220,7 @@ class Dispatcher:
         self.poll = poll
         self.lease = lease
         self.batch = batch
+        self.max_reclaims = max_reclaims
         self.me = f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
         self.failures: deque[Failure] = deque(maxlen=1000)
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -289,8 +298,8 @@ class Dispatcher:
             await db(self.outbox.release)
             return
         ev = job.event
-        if job.attempts > h.retries + 1:  # reclaimed after leases ran out: likely crashes us
-            await db(self.outbox.bury, f"lease expired on {job.attempts - 1} attempt(s)")
+        if job.reclaims > self.max_reclaims:  # its runs keep dying: likely it crashes us
+            await db(self.outbox.bury, f"lease expired {job.reclaims} times (dispatcher died mid-run)")
             return
         try:
             if h.where is None or h.where(ev):
@@ -302,8 +311,9 @@ class Dispatcher:
                         await res
         except Exception as e:  # noqa: BLE001 - handler errors must not kill the worker
             err = f"{type(e).__name__}: {e}"
-            if job.attempts <= h.retries:
-                at = time.time() + h.backoff * 2 ** (job.attempts - 1)
+            errors = job.errors + 1
+            if errors <= h.retries:
+                at = time.time() + h.backoff * 2 ** (errors - 1)
                 await db(self.outbox.retry_later, at, err)
                 return
             await db(self.outbox.bury, err)

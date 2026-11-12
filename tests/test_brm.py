@@ -470,20 +470,38 @@ def test_expired_lease_is_reclaimed_and_poison_buried(tree):
     import time
     got = []
     tree.dispatcher.stop()
-    tree.on("site", collect(got), retries=1)
+    tree.on("site", collect(got))  # retries=0: a crash must still not cost the delivery
     tree.update("site", 1, name="n1")
     tree.update("site", 1, name="n2")
     conn = tree.store.conn
-    # a dispatcher that died mid-run: one job on its first try, one on its last
+    # dispatchers that died mid-run: one job after its first start, one after 4 crashed starts
     conn.execute("UPDATE _brm_outbox SET status='running', claimed_by='dead', claimed_until=?, "
                  "attempts=1 WHERE id=(SELECT min(id) FROM _brm_outbox)", (time.time() - 1,))
     conn.execute("UPDATE _brm_outbox SET status='running', claimed_by='dead', claimed_until=?, "
-                 "attempts=2 WHERE id=(SELECT max(id) FROM _brm_outbox)", (time.time() - 1,))
+                 "attempts=4, reclaims=3 WHERE id=(SELECT max(id) FROM _brm_outbox)", (time.time() - 1,))
     tree.dispatcher.start()
     tree.drain(5)
     assert [e.row["name"] for e in got] == ["n1"]
     [dead] = tree.outbox.list("dead")
-    assert "lease expired" in dead["last_error"]
+    assert "lease expired 4 times" in dead["last_error"]
+
+
+def test_crash_then_error_still_gets_its_retries(tree):
+    import time
+    calls = []
+
+    def fails_once(e):
+        calls.append(1)
+        if len(calls) == 1:
+            raise IOError
+    tree.dispatcher.stop()
+    tree.on("site", fails_once, retries=1, backoff=0.001)
+    tree.update("site", 1, name="n")
+    tree.store.conn.execute("UPDATE _brm_outbox SET status='running', claimed_by='dead', "
+                            "claimed_until=?, attempts=1", (time.time() - 1,))
+    tree.dispatcher.start()
+    tree.drain(5)
+    assert len(calls) == 2 and tree.outbox.stats()["dead"] == 0
 
 
 def test_two_dispatchers_run_each_job_once(tmp_path):
