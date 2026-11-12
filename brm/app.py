@@ -5,7 +5,8 @@ from __future__ import annotations
 from contextlib import asynccontextmanager, contextmanager
 from typing import Any, Callable, Iterable, Iterator, Literal
 
-from .hooks import OPS, Dispatcher, Event, Failure, Handler, HandlerFn, Registry
+from .hooks import OPS, Event, Handler, HandlerFn, Registry
+from .outbox import Dispatcher, Failure, Outbox
 from .schema import Schema
 from .store import Store, Tx
 
@@ -26,6 +27,12 @@ class App:
 
     ``schema`` is SQL DDL text or a path to a .sql file. On an empty database it is
     executed; on an existing one it must match what is already there.
+
+    Handler jobs go through a durable outbox (``_brm_outbox``) in the same database,
+    so they survive crashes and are delivered at least once. ``dispatch=False`` makes
+    a process that only writes, and leaves running handlers to other processes on the
+    same database file. ``lease`` is how long a claimed job may run before another
+    dispatcher may take it over.
     """
 
     def __init__(
@@ -36,14 +43,23 @@ class App:
         order: Literal["bfs", "dfs"] = "bfs",
         concurrency: int = 1,
         on_error: Callable[[Failure], Any] | None = None,
+        dispatch: bool = True,
+        poll: float = 0.25,
+        lease: float = 60.0,
         title: str = "brm",
     ):
         if order not in ("bfs", "dfs"):
             raise ValueError("order must be 'bfs' or 'dfs'")
-        self.dispatcher = Dispatcher(concurrency=concurrency, on_error=on_error)
-        self.store = Store(db, schema, Registry, self.dispatcher, order=order)
+        self.store = Store(db, schema, Registry, order=order)
         self.schema: Schema = self.store.schema
         self.registry: Registry = self.store.registry
+        self.outbox = Outbox(self.store)
+        self.store.outbox = self.outbox
+        self.dispatcher = Dispatcher(self.outbox, self.registry, concurrency=concurrency,
+                                     on_error=on_error, poll=poll, lease=lease)
+        self.store.on_commit = self.dispatcher.wake
+        if dispatch:
+            self.dispatcher.start()
         self.title = title
         self._fastapi = None
         self._by_fn: dict[Any, list[Handler]] = {}
@@ -74,7 +90,9 @@ class App:
         depth   max foreign-key hops between the changed row and ``table``'s row
         source  only changes to these tables
         where   predicate on the Event, checked at dispatch time
-        retries extra attempts on exception, sleeping backoff * 2**n between them
+        retries extra attempts on exception, waiting backoff * 2**n between them
+        name    stable id for queued jobs (default "<table>:<function name>"); jobs
+                survive restarts by name, so rename a handler only after draining it
 
         Use as ``@app.on(...)`` or ``app.on(table, fn, ...)``; returns ``fn``.
         """
@@ -90,7 +108,7 @@ class App:
                 where=where,
                 retries=retries,
                 backoff=backoff,
-                name=name or getattr(f, "__name__", repr(f)),
+                name=name or f"{table}:{getattr(f, '__name__', type(f).__name__)}",
             )
             self.registry.add(h)
             self._by_fn.setdefault(f, []).append(h)
@@ -108,7 +126,7 @@ class App:
         return list(self.registry.handlers)
 
     def drain(self, timeout: float | None = None) -> bool:
-        """Wait until all committed changes have been handled."""
+        """Wait until every queued job for this process's handlers has run (or died)."""
         return self.dispatcher.drain(timeout)
 
     @property
@@ -144,7 +162,8 @@ class App:
             return Tx(self.store).select(table, where, **kw)
 
     def close(self) -> None:
-        self.dispatcher.drain(10)
+        if self.dispatcher.running:
+            self.dispatcher.drain(10)
         self.dispatcher.stop()
         self.store.close()
 
@@ -164,9 +183,9 @@ class App:
 
             @asynccontextmanager
             async def lifespan(_):
-                self.dispatcher.start()
                 yield
-                self.dispatcher.drain(10)
+                if self.dispatcher.running:
+                    self.dispatcher.drain(10)
 
             api = FastAPI(title=self.title, lifespan=lifespan)
             api.include_router(self.router())

@@ -1,14 +1,13 @@
-"""Change events, handler registration, the foreign-key walk that decides which
-handlers a change reaches, and the background dispatcher that runs them."""
+"""Change events, handler registration, and the foreign-key walk that decides
+which handlers a change reaches."""
 
 from __future__ import annotations
 
-import asyncio
-import inspect
+import base64
+import json
 import logging
-import threading
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Iterable, Literal
 
 from .schema import ForeignKey, Schema
@@ -84,6 +83,33 @@ class Event:
             "change": self.change.to_dict(),
         }
 
+    @classmethod
+    def from_dict(cls, d: dict) -> "Event":
+        c = d["change"]
+        change = Change(c["table"], c["op"], tuple(c["key"]), c["old"], c["new"])
+        path = tuple(Hop(h["table"], tuple(h["key"]), h["via"]) for h in d["path"])
+        return cls(change, d["table"], d["row"], d["relation"], d["depth"], path)
+
+    def dumps(self) -> str:
+        """Lossless JSON (BLOBs as {"$b64": ...}) for the outbox."""
+        return json.dumps(self.to_dict(), default=_enc, separators=(",", ":"))
+
+    @classmethod
+    def loads(cls, s: str) -> "Event":
+        return cls.from_dict(json.loads(s, object_hook=_dec))
+
+
+def _enc(v: Any) -> Any:
+    if isinstance(v, (bytes, bytearray, memoryview)):
+        return {"$b64": base64.b64encode(bytes(v)).decode()}
+    raise TypeError(f"cannot store {type(v).__name__} in an event")
+
+
+def _dec(d: dict) -> Any:
+    if len(d) == 1 and "$b64" in d:
+        return base64.b64decode(d["$b64"])
+    return d
+
 
 HandlerFn = Callable[[Event], Any] | Callable[[Event], Awaitable[Any]]
 
@@ -113,6 +139,7 @@ class Registry:
     def __init__(self, schema: Schema):
         self.schema = schema
         self.handlers: list[Handler] = []
+        self.by_name: dict[str, Handler] = {}
         self._by: dict[tuple[str, str], list[Handler]] = {}
         # shortest hop counts between tables, walking up (to parents) and down (to children)
         self.dist = {
@@ -145,6 +172,11 @@ class Registry:
         for s in h.source or ():
             if s not in self.schema:
                 raise KeyError(f"unknown source table {s!r}")
+        if h.name in self.by_name:
+            raise ValueError(
+                f"a handler named {h.name!r} is already registered; pass name= to tell them apart "
+                "(names identify queued jobs across restarts, so keep them stable)")
+        self.by_name[h.name] = h
         self.handlers.append(h)
         self._slack.clear()
         for w in h.watch:
@@ -153,6 +185,7 @@ class Registry:
 
     def remove(self, h: Handler) -> None:
         self.handlers.remove(h)
+        del self.by_name[h.name]
         self._slack.clear()
         for w in h.watch:
             self._by[(h.table, w)].remove(h)
@@ -261,118 +294,3 @@ def plan(
     else:
         raise ValueError(f"order must be 'bfs' or 'dfs', got {order!r}")
     return jobs
-
-
-@dataclass
-class Failure:
-    handler: Handler
-    event: Event
-    error: BaseException
-    attempts: int
-
-
-class Dispatcher:
-    """Runs handlers after commit on a private asyncio loop in a daemon thread.
-
-    Jobs from one change run in walk order; changes run in commit order. With
-    ``concurrency > 1`` several changes are worked on at once (order across
-    changes is then not kept). Sync handlers run in the loop's thread pool.
-    """
-
-    def __init__(self, concurrency: int = 1, on_error: Callable[[Failure], Any] | None = None):
-        self.concurrency = concurrency
-        self.on_error = on_error
-        self.failures: deque[Failure] = deque(maxlen=1000)
-        self._loop: asyncio.AbstractEventLoop | None = None
-        self._queue: asyncio.Queue | None = None
-        self._thread: threading.Thread | None = None
-        self._started = threading.Event()
-        self._lock = threading.Lock()
-        self._idle = threading.Condition()
-        self._pending = 0
-
-    def start(self) -> None:
-        with self._lock:
-            if self._thread is not None:
-                return
-            self._thread = threading.Thread(target=self._run, name="brm-dispatch", daemon=True)
-            self._thread.start()
-        self._started.wait()
-
-    def _run(self) -> None:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        self._loop = loop
-        self._queue = asyncio.Queue()
-        workers = [loop.create_task(self._worker()) for _ in range(self.concurrency)]
-        self._started.set()
-        try:
-            loop.run_forever()
-        finally:
-            for w in workers:
-                w.cancel()
-            loop.run_until_complete(asyncio.gather(*workers, return_exceptions=True))
-            loop.close()
-
-    def submit(self, jobs: list[tuple[Handler, Event]]) -> None:
-        if not jobs:
-            return
-        self.start()
-        with self._idle:
-            self._pending += 1
-        assert self._loop is not None and self._queue is not None
-        self._loop.call_soon_threadsafe(self._queue.put_nowait, jobs)
-
-    async def _worker(self) -> None:
-        assert self._queue is not None
-        while True:
-            jobs = await self._queue.get()
-            try:
-                for h, ev in jobs:
-                    await self._run_one(h, ev)
-            finally:
-                with self._idle:
-                    self._pending -= 1
-                    self._idle.notify_all()
-
-    async def _run_one(self, h: Handler, ev: Event) -> None:
-        attempt = 0
-        while True:
-            attempt += 1
-            try:
-                if h.where is not None and not h.where(ev):
-                    return
-                if inspect.iscoroutinefunction(h.fn):
-                    await h.fn(ev)
-                else:
-                    res = await asyncio.get_running_loop().run_in_executor(None, h.fn, ev)
-                    if inspect.isawaitable(res):
-                        await res
-                return
-            except Exception as e:  # noqa: BLE001 - handler errors must not kill the worker
-                if attempt <= h.retries:
-                    await asyncio.sleep(h.backoff * 2 ** (attempt - 1))
-                    continue
-                f = Failure(h, ev, e, attempt)
-                self.failures.append(f)
-                log.error("brm handler %s failed on %s %s after %d attempt(s): %r",
-                          h.name, ev.table, list(ev.key), attempt, e)
-                if self.on_error is not None:
-                    try:
-                        self.on_error(f)
-                    except Exception:  # noqa: BLE001
-                        log.exception("brm on_error callback failed")
-                return
-
-    def drain(self, timeout: float | None = None) -> bool:
-        """Block until every submitted change has been handled. False on timeout."""
-        with self._idle:
-            return self._idle.wait_for(lambda: self._pending == 0, timeout)
-
-    def stop(self) -> None:
-        if self._loop is not None and self._thread is not None:
-            self._loop.call_soon_threadsafe(self._loop.stop)
-            self._thread.join()
-            self._thread = None
-            self._loop = None
-            self._started.clear()

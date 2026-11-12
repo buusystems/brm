@@ -1,6 +1,6 @@
 """SQLite storage: applies the DDL, runs CRUD inside transactions, and turns each
-write into a Change whose handler jobs are planned in-transaction and dispatched
-after commit."""
+write into a Change whose handler jobs are planned and written to the outbox in
+the same transaction."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import threading
 from contextlib import contextmanager
 from typing import Any, Iterator
 
-from .hooks import Change, Dispatcher, Registry, plan
+from .hooks import Change, Registry, plan
 from .schema import Schema, Table, introspect, q
 
 
@@ -43,12 +43,13 @@ class Store:
     """One SQLite connection guarded by a re-entrant lock. Writes serialize anyway in
     SQLite, and one connection keeps ``:memory:`` databases working."""
 
-    def __init__(self, path: str, ddl: str, registry_factory, dispatcher: Dispatcher, order: str = "bfs"):
+    def __init__(self, path: str, ddl: str, registry_factory, order: str = "bfs"):
         self.path = path
         self.conn = _connect(path)
         self.lock = threading.RLock()
         self.order = order
-        self.dispatcher = dispatcher
+        self.outbox = None  # set by App: the Outbox jobs are written to
+        self.on_commit = None  # called after a commit that queued jobs
         self.schema = self._apply(_load_ddl(ddl))
         self.registry: Registry = registry_factory(self.schema)
         self._local = threading.local()
@@ -83,8 +84,8 @@ class Store:
 
     @contextmanager
     def transaction(self) -> Iterator["Tx"]:
-        """Re-entrant per thread: nested calls join the outer transaction, and every
-        change's handlers are dispatched once the outermost one commits."""
+        """Re-entrant per thread: nested calls join the outer transaction. Handler jobs
+        are written to the outbox as part of it, so they commit or roll back with it."""
         cur: Tx | None = getattr(self._local, "tx", None)
         if cur is not None:
             yield cur
@@ -102,8 +103,8 @@ class Store:
                 self.conn.execute("COMMIT")
             finally:
                 self._local.tx = None
-        for jobs in tx.jobs:
-            self.dispatcher.submit(jobs)
+        if tx.queued and self.on_commit is not None:
+            self.on_commit()
 
 
 class Tx:
@@ -111,7 +112,7 @@ class Tx:
         self.store = store
         self.conn = store.conn
         self.schema = store.schema
-        self.jobs: list[list] = []
+        self.queued = 0  # outbox jobs written by this transaction
         self.changes: list[Change] = []
 
     # -- reads ---------------------------------------------------------------
@@ -182,7 +183,8 @@ class Tx:
         self.changes.append(change)
         jobs = self._plan(change) if jobs is None else jobs
         if jobs:
-            self.jobs.append(jobs)
+            self.store.outbox.enqueue(jobs)
+            self.queued += len(jobs)
 
     def insert(self, table: str, values: dict[str, Any]) -> dict:
         t = self.schema[table]

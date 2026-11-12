@@ -111,17 +111,26 @@ When it happens, relative to the write:
 sequenceDiagram
     participant Client
     participant API as brm (FastAPI)
-    participant DB as SQLite transaction
-    participant Q as Dispatcher (background loop)
+    participant DB as SQLite (tables + _brm_outbox)
+    participant Q as Dispatcher (any process)
     participant H as Handlers (MQTT, webhook, ...)
     Client->>API: PATCH /c/7
     API->>DB: BEGIN, UPDATE c
-    API->>DB: walk FK graph (SELECTs), list (handler, event) jobs
-    API->>DB: COMMIT
+    API->>DB: walk FK graph (SELECTs)
+    API->>DB: INSERT one outbox job per (handler, row reached)
+    API->>DB: COMMIT (row change and jobs together, or neither)
     API-->>Client: 200 (does not wait for handlers)
-    API->>Q: submit jobs (dropped if the transaction rolled back)
-    loop walk order (BFS or DFS)
-        Q->>H: fn(event), retried with backoff on error
+    API-)Q: wake up
+    loop until the outbox is empty
+        Q->>DB: claim jobs under a lease
+        Q->>H: fn(event)
+        alt success
+            Q->>DB: delete job
+        else error, attempts left
+            Q->>DB: back to pending after backoff * 2^n
+        else out of attempts
+            Q->>DB: mark dead (requeue with POST /_brm/outbox/requeue)
+        end
     end
 ```
 
@@ -138,6 +147,10 @@ For each table `t` with primary key `k`:
 | DELETE | `/t/{k}` | delete; returns the deleted row |
 | GET | `/t/{k}/child` | rows of `child` that reference this row (`child.col` when there are several FKs to `t`) |
 | GET | `/_schema` | tables, columns and the FK graph |
+| GET | `/_brm/outbox` | job counts per status and handler |
+| GET | `/_brm/outbox/{dead,pending,running}` | list jobs with their events and last error (`?handler=`) |
+| POST | `/_brm/outbox/requeue` | retry dead jobs: all, `{"ids": [...]}` or `{"handler": "..."}` |
+| DELETE | `/_brm/outbox/dead` | discard dead jobs (`?handler=`) |
 
 A foreign-key, UNIQUE or NOT NULL violation returns 409; a bad body returns 422; an unknown key returns 404.
 Tables without a declared primary key are addressed by `rowid`.
@@ -169,19 +182,44 @@ A handler receives an `Event`:
 - `ev.change`: the change itself, with `table`, `op`, `key`, `old`, `new`, `.row` and
   `.changed` (the set of columns that changed).
 
-### When they run
+### When they run: the durable outbox
 
-1. A write (over HTTP or `app.insert/update/delete`, or several grouped in
-   `with app.transaction() as tx:`) plans its walk **inside the transaction**. Inserts and
-   updates are planned after the write and deletes before it, so rows that
+1. A write plans its walk **inside its transaction**. A write is a call over HTTP, a call
+   to `app.insert/update/delete`, or several grouped in `with app.transaction() as tx:`.
+   Inserts and updates are planned after the write and deletes before it, so rows that
    `ON DELETE CASCADE` will remove are still reached.
-2. After **commit**, the jobs go to a background dispatcher, so a slow or failing handler
-   never blocks or rolls back the write. Nothing runs if the transaction rolls back.
-3. Jobs from one change run in walk order. With the default `concurrency=1`, changes run in
-   commit order. Sync handlers run in a thread pool, and `async def` handlers are awaited.
-4. If a handler raises, it is retried `retries` times, waiting `backoff * 2**n` between
-   attempts. The final failure is logged, kept in `app.failures` and passed to
-   `App(on_error=...)`.
+2. Each (handler, row reached) pair becomes a row in **`_brm_outbox`**, written in that same
+   transaction. The change and its jobs commit together. A rollback leaves no jobs, and a
+   crash after commit loses none.
+3. A **dispatcher** claims jobs under a lease (`App(lease=60)` seconds), runs the handler,
+   and deletes the job. It is woken right after each commit and otherwise polls every
+   `App(poll=0.25)` seconds. A slow or failing handler never blocks or rolls back a write.
+4. If a handler raises, the job goes back to pending and waits `backoff * 2**n` before the
+   next attempt; jobs behind it are not held up. After `retries` extra attempts it is
+   marked **dead**. Dead jobs stay in the table with their event and last error, are passed
+   to `App(on_error=...)`, and can be requeued with `app.outbox.requeue()` or
+   `POST /_brm/outbox/requeue`.
+5. If a dispatcher dies mid-job, its lease runs out and another dispatcher claims the job
+   again. A job that keeps killing its dispatcher is marked dead once it runs out of
+   attempts.
+
+**Delivery is at-least-once, so make handlers idempotent.** For example, use
+`ev.change.key` together with `ev.change.op` as a deduplication key downstream.
+
+Order: with the default `concurrency=1`, jobs start in commit order, and in walk order
+within a change. A job waiting to retry is overtaken by the jobs behind it. Sync handlers run
+in a thread pool, and `async def` handlers are awaited.
+
+**Handler names identify jobs across restarts.** A name defaults to `"<table>:<function name>"`,
+and must be unique (pass `name=` to tell two handlers apart). Renaming a handler leaves
+any jobs still queued under the old name waiting. Drain the queue first, or clear them with
+`app.outbox.purge("pending", handler=old_name)`.
+
+**Several processes** can share one database file, for example several uvicorn workers, or
+API processes plus separate worker processes. Each claim is exclusive, so every job runs in
+one process. The process that writes is the one that plans, so **every process must
+register every handler**. `App(dispatch=False)` makes a process that only writes and leaves
+running the handlers to the others.
 
 How the walk behaves:
 
@@ -196,8 +234,9 @@ How the walk behaves:
 A handler may write to the database itself; its writes are new changes. Avoid handlers that
 trigger each other forever.
 
-`app.drain()` waits until every committed change has been handled, which is useful in tests
-and scripts. `app.off(fn)` unregisters a handler.
+`app.drain()` waits until no job for this process's handlers is pending or running, which
+is useful in tests and scripts. `app.off(fn)` unregisters a handler. `app.outbox.stats()`
+shows the queue.
 
 ### Built-ins (`brm.handlers`)
 
@@ -218,8 +257,9 @@ The default payload is the event as JSON.
 - `schema` is DDL text or a path to a `.sql` file. On an empty database brm runs it. On an
   existing database the tables must match the DDL; otherwise `SchemaMismatch` is raised.
   There are no migrations yet.
-- brm turns on `PRAGMA foreign_keys` and WAL. It uses one connection behind a lock, which
-  suits SQLite's single writer.
+- brm turns on `PRAGMA foreign_keys` and WAL. Each process uses one connection behind a
+  lock, which suits SQLite's single writer. Tables named `_brm_*` belong to brm and are
+  left out of the API and the schema check.
 - Changes made outside brm, such as from the `sqlite3` shell, by `ON DELETE CASCADE`, or by
   SQL triggers, do not fire handlers. Cascaded rows are reached by an `"ancestors"` walk
   from the row deleted through brm.
@@ -233,3 +273,7 @@ python3 -m venv .venv && .venv/bin/pip install -e '.[dev]'
 
 `examples/iot` is a site → device → sensor → reading demo. To run it with a broker:
 `BRM_MQTT=localhost uvicorn examples.iot.app:app`.
+
+## License
+
+brm is free software under the [GNU General Public License v3.0 or later](LICENSE).

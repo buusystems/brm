@@ -394,3 +394,125 @@ def test_mqtt_publish_handler(tree):
     assert topic == "alerts/device/1/insert/reading" and qos == 1
     body = json.loads(payload)
     assert body["change"]["new"]["value"] == 7 and body["relation"] == "descendants"
+
+
+# -- durable outbox ----------------------------------------------------------------------
+
+
+def test_jobs_survive_a_restart(tmp_path):
+    p = str(tmp_path / "d.db")
+    a = App(p, schema=IOT, dispatch=False)  # writer only: nothing runs here
+    a.on("site", lambda e: None, watch="descendants", name="ping")
+    a.insert("site", name="s")
+    a.insert("device", site_id=1, name="d")
+    assert a.outbox.stats()["pending"] == 1
+    a.close()  # "crash": the job is only in the database
+
+    got = []
+    b = App(p, schema=IOT)
+    b.on("site", collect(got), watch="descendants", name="ping")
+    assert b.drain(5)
+    assert seen(got) == [("site", (1,), "descendants", 1)]
+    assert got[0].change.new == {"id": 1, "site_id": 1, "name": "d", "online": 1}
+    assert b.outbox.stats()["pending"] == 0
+    b.close()
+
+
+def test_rollback_queues_nothing(tree):
+    tree.on("sensor", lambda e: None)
+    with pytest.raises(RuntimeError):
+        with tree.transaction() as tx:
+            tx.insert("sensor", {"device_id": 1, "kind": "x"})
+            assert tree.outbox.outstanding() == 1  # visible inside the transaction
+            raise RuntimeError
+    assert tree.outbox.outstanding() == 0
+
+
+def test_dead_letters_and_requeue(tree):
+    ok = []
+    broken = [True]
+
+    def flaky(e):
+        if broken[0]:
+            raise IOError("down")
+        ok.append(e.key)
+    tree.on("device", flaky)
+    tree.update("device", 1, name="x")
+    tree.drain()
+    st = tree.outbox.stats()
+    assert st["dead"] == 1 and st["handlers"] == {"device:flaky": {"dead": 1}}
+    [dead] = tree.outbox.list("dead")
+    assert dead["last_error"] == "OSError: down" and dead["event"]["row"]["name"] == "x"
+    broken[0] = False
+    c = TestClient(tree)
+    assert c.get("/_brm/outbox").json()["dead"] == 1
+    assert c.post("/_brm/outbox/requeue", json={}).json() == {"requeued": 1}
+    tree.drain()
+    assert ok == [(1,)] and tree.outbox.stats()["dead"] == 0
+
+
+def test_retry_does_not_block_later_jobs(tree):
+    order = []
+
+    def slow_fail(e):
+        order.append(("fail", e.key))
+        if len([o for o in order if o[0] == "fail"]) == 1:
+            raise IOError
+    tree.on("device", slow_fail, retries=1, backoff=0.2)
+    tree.on("sensor", lambda e: order.append(("ok", e.key)), name="ok")
+    tree.update("device", 1, name="x")
+    tree.update("sensor", 1, kind="y")
+    tree.drain()
+    assert order == [("fail", (1,)), ("ok", (1,)), ("fail", (1,))]
+
+
+def test_expired_lease_is_reclaimed_and_poison_buried(tree):
+    import time
+    got = []
+    tree.dispatcher.stop()
+    tree.on("site", collect(got), retries=1)
+    tree.update("site", 1, name="n1")
+    tree.update("site", 1, name="n2")
+    conn = tree.store.conn
+    # a dispatcher that died mid-run: one job on its first try, one on its last
+    conn.execute("UPDATE _brm_outbox SET status='running', claimed_by='dead', claimed_until=?, "
+                 "attempts=1 WHERE id=(SELECT min(id) FROM _brm_outbox)", (time.time() - 1,))
+    conn.execute("UPDATE _brm_outbox SET status='running', claimed_by='dead', claimed_until=?, "
+                 "attempts=2 WHERE id=(SELECT max(id) FROM _brm_outbox)", (time.time() - 1,))
+    tree.dispatcher.start()
+    tree.drain(5)
+    assert [e.row["name"] for e in got] == ["n1"]
+    [dead] = tree.outbox.list("dead")
+    assert "lease expired" in dead["last_error"]
+
+
+def test_two_dispatchers_run_each_job_once(tmp_path):
+    p = str(tmp_path / "s.db")
+    a, b = App(p, schema=IOT), App(p, schema=IOT)
+    ga, gb = [], []
+    a.on("site", collect(ga), name="ping")  # same handler (by name) in both processes
+    b.on("site", collect(gb), name="ping")
+    for i in range(40):
+        a.insert("site", name=f"s{i}")
+    assert a.drain(5) and b.drain(5)
+    keys = sorted(e.key for e in ga + gb)
+    assert keys == [(i,) for i in range(1, 41)]  # every job once, none twice
+    a.close(), b.close()
+
+
+def test_handler_names_are_unique(app):
+    def f(e): pass
+    app.on("site", f)
+    with pytest.raises(ValueError, match="already registered"):
+        app.on("site", f, watch="descendants")
+    app.on("site", f, watch="descendants", name="site:f:desc")
+
+
+def test_blob_round_trip():
+    a = App(schema="CREATE TABLE b (id INTEGER PRIMARY KEY, data BLOB);")
+    got = []
+    a.on("b", collect(got))
+    a.insert("b", data=b"\x00\xff")
+    a.drain()
+    assert got[0].row["data"] == b"\x00\xff"
+    a.close()

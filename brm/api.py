@@ -123,9 +123,40 @@ def build_router(app: "App") -> APIRouter:
     def get_schema() -> dict:
         return schema.to_dict()
 
+    _outbox_routes(router, app)
     for t in schema:
         _table_routes(router, app, t)
     return router
+
+
+class Requeue(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    ids: Optional[list[int]] = None
+    handler: Optional[str] = None
+
+
+def _outbox_routes(router: APIRouter, app: "App") -> None:
+    tags = ["_brm"]
+
+    @router.get("/_brm/outbox", tags=tags, summary="Outbox job counts per status and handler")
+    def outbox_stats() -> dict:
+        return app.outbox.stats()
+
+    @router.get("/_brm/outbox/{status}", tags=tags, summary="List outbox jobs (dead, pending or running)")
+    def outbox_list(status: str, handler: Optional[str] = None, limit: int = 100) -> list[dict]:
+        if status not in ("dead", "pending", "running"):
+            raise HTTPException(400, "status is dead, pending or running")
+        return app.outbox.list(status, min(limit, MAX_LIMIT), handler)
+
+    @router.post("/_brm/outbox/requeue", tags=tags, summary="Retry dead jobs (all, by id, or by handler)")
+    def outbox_requeue(body: Requeue = Body(default_factory=Requeue)) -> dict:
+        n = app.outbox.requeue(body.ids, body.handler)
+        app.dispatcher.wake()
+        return {"requeued": n}
+
+    @router.delete("/_brm/outbox/dead", tags=tags, summary="Delete dead jobs (optionally one handler's)")
+    def outbox_purge(handler: Optional[str] = None) -> dict:
+        return {"deleted": app.outbox.purge("dead", handler)}
 
 
 def _table_routes(router: APIRouter, app: "App", t: Table) -> None:

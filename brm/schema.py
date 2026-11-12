@@ -124,7 +124,8 @@ def introspect(conn: sqlite3.Connection) -> Schema:
         r[0]
         for r in conn.execute(
             "SELECT name FROM sqlite_schema WHERE type='table' "
-            "AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_brm_%' ORDER BY name"
+            "AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' AND name NOT LIKE '\\_brm\\_%' ESCAPE '\\' "
+            "ORDER BY name"
         )
     ]
     tables: dict[str, Table] = {}
