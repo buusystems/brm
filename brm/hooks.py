@@ -1,5 +1,5 @@
 """Change events, handler registration, and the foreign-key walk that decides
-which handlers a change reaches."""
+which handlers a change reaches (see routes.py for the ``via`` syntax)."""
 
 from __future__ import annotations
 
@@ -10,14 +10,13 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Iterable, Literal
 
-from .schema import ForeignKey, Schema
+from .routes import Route, parse
+from .schema import Schema
 
 log = logging.getLogger("brm")
 
 Op = Literal["insert", "update", "delete"]
-Watch = Literal["self", "descendants", "ancestors"]
 OPS: frozenset[str] = frozenset(("insert", "update", "delete"))
-WATCHES: frozenset[str] = frozenset(("self", "descendants", "ancestors"))
 
 
 @dataclass(frozen=True)
@@ -49,22 +48,23 @@ class Change:
 class Hop:
     table: str
     key: tuple
-    via: str | None  # foreign key used to arrive here (None at the origin)
+    via: str | None  # foreign key used to arrive here, "table.col" (None at the origin)
+    row: dict  # the row as the walk saw it, inside the write's transaction
 
 
 @dataclass(frozen=True)
 class Event:
     """What a handler receives: the row it is registered on, and the change that reached it.
 
-    relation is "self" when ``row`` is the changed row, "descendants" when the change
-    happened in a row that (transitively) references ``row``, and "ancestors" when it
-    happened in a row that ``row`` (transitively) references.
+    ``via`` is the handler's route (None when ``row`` is the changed row itself),
+    ``depth`` the number of foreign-key hops walked, and ``path`` every row on the
+    way, from the changed row (``path[0]``) to this one (``path[-1]``).
     """
 
     change: Change
     table: str
     row: dict
-    relation: Watch
+    via: str | None
     depth: int
     path: tuple[Hop, ...]
 
@@ -72,14 +72,22 @@ class Event:
     def key(self) -> tuple:
         return self.path[-1].key
 
+    def at(self, table: str) -> dict | None:
+        """The first row of ``table`` on the path, e.g. ``ev.at("sensor")`` for a reading's
+        sensor while a device hears about the reading."""
+        for h in self.path:
+            if h.table == table:
+                return h.row
+        return None
+
     def to_dict(self) -> dict:
         return {
             "table": self.table,
             "key": list(self.key),
             "row": self.row,
-            "relation": self.relation,
+            "via": self.via,
             "depth": self.depth,
-            "path": [{"table": h.table, "key": list(h.key), "via": h.via} for h in self.path],
+            "path": [{"table": h.table, "key": list(h.key), "via": h.via, "row": h.row} for h in self.path],
             "change": self.change.to_dict(),
         }
 
@@ -87,8 +95,8 @@ class Event:
     def from_dict(cls, d: dict) -> "Event":
         c = d["change"]
         change = Change(c["table"], c["op"], tuple(c["key"]), c["old"], c["new"])
-        path = tuple(Hop(h["table"], tuple(h["key"]), h["via"]) for h in d["path"])
-        return cls(change, d["table"], d["row"], d["relation"], d["depth"], path)
+        path = tuple(Hop(h["table"], tuple(h["key"]), h["via"], h["row"]) for h in d["path"])
+        return cls(change, d["table"], d["row"], d["via"], d["depth"], path)
 
     def dumps(self) -> str:
         """Lossless JSON (BLOBs as {"$b64": ...}) for the outbox."""
@@ -118,21 +126,17 @@ HandlerFn = Callable[[Event], Any] | Callable[[Event], Awaitable[Any]]
 class Handler:
     fn: HandlerFn
     table: str
-    watch: frozenset[str]
+    route: Route | None = None  # None: the handler's own rows only
     ops: frozenset[str] = OPS
-    depth: int | None = None  # max hops from the changed row; None = unlimited
-    source: frozenset[str] | None = None  # only changes originating in these tables
-    where: Callable[[Event], bool] | None = None
+    max_hops: int | None = None  # cap on hops walked (for self-references); None = no cap
+    where: Callable[[Event], bool] | None = None  # checked in the write's transaction
     retries: int = 0
     backoff: float = 0.5  # seconds, doubled per retry
     name: str = ""
 
-    def accepts(self, change: Change, depth: int) -> bool:
-        return (
-            change.op in self.ops
-            and (self.source is None or change.table in self.source)
-            and (self.depth is None or depth <= self.depth)
-        )
+    @property
+    def via(self) -> str | None:
+        return None if self.route is None else self.route.text
 
 
 class Registry:
@@ -140,77 +144,57 @@ class Registry:
         self.schema = schema
         self.handlers: list[Handler] = []
         self.by_name: dict[str, Handler] = {}
-        self._by: dict[tuple[str, str], list[Handler]] = {}
-        # shortest hop counts between tables, walking up (to parents) and down (to children)
-        self.dist = {
-            "up": {t.name: self._hops(t.name, lambda n: [fk.parent for fk in schema[n].fks]) for t in schema},
-            "down": {t.name: self._hops(t.name, lambda n: [fk.child for fk in schema[n].refs]) for t in schema},
-        }
-        self._slack: dict[tuple, float] = {}
+        self._own: dict[str, list[Handler]] = {}  # table -> handlers with no route
+        # start table -> (target table, route text, max_hops) -> (route, handlers)
+        self._routes: dict[str, dict[tuple[str, str, int | None], tuple[Route, list[Handler]]]] = {}
 
-    @staticmethod
-    def _hops(start: str, nxt: Callable[[str], Iterable[str]]) -> dict[str, int]:
-        dist = {start: 0}
-        todo = deque([start])
-        while todo:
-            n = todo.popleft()
-            for m in nxt(n):
-                if m not in dist:
-                    dist[m] = dist[n] + 1
-                    todo.append(m)
-        return dist
+    def route(self, table: str, via: str) -> Route:
+        return parse(self.schema, table, via)
 
     def add(self, h: Handler) -> Handler:
         if h.table not in self.schema:
             raise KeyError(f"unknown table {h.table!r}")
-        bad = h.watch - WATCHES
-        if bad:
-            raise ValueError(f"watch must be among {sorted(WATCHES)}, got {sorted(bad)}")
         bad = h.ops - OPS
         if bad:
             raise ValueError(f"ops must be among {sorted(OPS)}, got {sorted(bad)}")
-        for s in h.source or ():
-            if s not in self.schema:
-                raise KeyError(f"unknown source table {s!r}")
+        if h.max_hops is not None and h.max_hops < 1:
+            raise ValueError("max_hops must be at least 1")
         if h.name in self.by_name:
             raise ValueError(
                 f"a handler named {h.name!r} is already registered; pass name= to tell them apart "
                 "(names identify queued jobs across restarts, so keep them stable)")
         self.by_name[h.name] = h
         self.handlers.append(h)
-        self._slack.clear()
-        for w in h.watch:
-            self._by.setdefault((h.table, w), []).append(h)
+        if h.route is None:
+            self._own.setdefault(h.table, []).append(h)
+        else:
+            group = self._routes.setdefault(h.route.start, {})
+            k = (h.route.target, h.route.text, h.max_hops)
+            group.setdefault(k, (h.route, []))[1].append(h)
         return h
 
     def remove(self, h: Handler) -> None:
         self.handlers.remove(h)
         del self.by_name[h.name]
-        self._slack.clear()
-        for w in h.watch:
-            self._by[(h.table, w)].remove(h)
+        if h.route is None:
+            self._own[h.table].remove(h)
+        else:
+            group = self._routes[h.route.start]
+            k = (h.route.target, h.route.text, h.max_hops)
+            group[k][1].remove(h)
+            if not group[k][1]:
+                del group[k]
 
-    def matching(self, table: str, relation: str, change: Change, depth: int) -> list[Handler]:
-        return [h for h in self._by.get((table, relation), ()) if h.accepts(change, depth)]
+    def own(self, change: Change) -> list[Handler]:
+        return [h for h in self._own.get(change.table, ()) if change.op in h.ops]
 
-    def slack(self, table: str, direction: str, change: Change) -> float:
-        """Deepest hop at which arriving at ``table`` can still lead to a handler.
-
-        Walking ``direction`` from ``table``, a handler on table Y watching the matching
-        relation, ``dist`` hops further on, fires up to its own ``depth``; so arriving
-        here at hop d is useful only while d <= depth - dist. -inf: nothing ahead.
-        """
-        k = (table, direction, change.table, change.op)
-        v = self._slack.get(k)
-        if v is None:
-            rel = "descendants" if direction == "up" else "ancestors"
-            v = float("-inf")
-            for y, d in self.dist[direction][table].items():
-                for h in self._by.get((y, rel), ()):
-                    if h.accepts(change, 0):
-                        v = max(v, float("inf") if h.depth is None else h.depth - d)
-            self._slack[k] = v
-        return v
+    def routes_from(self, change: Change) -> list[tuple[Route, int | None, list[Handler]]]:
+        out = []
+        for (_, _, max_hops), (route, hs) in self._routes.get(change.table, {}).items():
+            hs = [h for h in hs if change.op in h.ops]
+            if hs:
+                out.append((route, max_hops, hs))
+        return out
 
 
 Fetch = Callable[[str, tuple[str, ...], tuple], list[dict]]
@@ -219,78 +203,106 @@ Fetch = Callable[[str, tuple[str, ...], tuple], list[dict]]
 def plan(
     registry: Registry, change: Change, fetch: Fetch, order: Literal["bfs", "dfs"] = "bfs"
 ) -> list[tuple[Handler, Event]]:
-    """Walk the FK graph out from ``change`` and list every (handler, event) it reaches.
+    """Every (handler, event) a change reaches.
 
     Called inside the write transaction (before a delete, after an insert/update) so
-    the rows seen are exactly those around the change at commit time. Each row is
-    visited once per change, along the first path found (shortest for BFS). The walk
-    up goes to parents through foreign keys; the walk down goes to children that
-    reference the row. Both stop early where no handler further on could fire.
+    the rows seen are exactly those around the change at commit time. Only routes
+    that start at the changed table are walked, and each only along its own foreign
+    keys. A row is reached once per route, along the first path found (the shortest
+    with BFS); the changed row itself is never reached through a route. ``where`` is
+    checked here, so filtered-out events are never queued.
     """
     schema = registry.schema
-    origin = Hop(change.table, change.key, None)
+    origin = Hop(change.table, change.key, None, change.row)
     jobs: list[tuple[Handler, Event]] = []
-    for h in registry.matching(change.table, "self", change, 0):
-        jobs.append((h, Event(change, change.table, change.row, "self", 0, (origin,))))
 
-    # node: (table, row, depth, direction, path)
-    frontier: deque = deque()
-    visited: set[tuple[str, tuple]] = {(change.table, change.key)}
+    def offer(h: Handler, ev: Event) -> None:
+        if h.where is not None:
+            try:
+                if not h.where(ev):
+                    return
+            except Exception:  # noqa: BLE001 - a broken predicate must not block writes
+                log.exception("brm: where= of %s raised; queueing the job anyway", h.name)
+        jobs.append((h, ev))
 
-    def expand(table: str, row: dict, depth: int, direction: str, path: tuple[Hop, ...]) -> list:
+    for h in registry.own(change):
+        offer(h, Event(change, change.table, change.row, None, 0, (origin,)))
+
+    cache: dict[tuple, list[dict]] = {}
+
+    def get(table: str, cols: tuple[str, ...], vals: tuple) -> list[dict]:
+        k = (table, cols, vals)
+        if k not in cache:
+            cache[k] = fetch(table, cols, vals)
+        return cache[k]
+
+    for route, max_hops, handlers in registry.routes_from(change):
+        for table, row, depth, path in _walk(schema, route, max_hops, change, origin, get, order):
+            for h in handlers:
+                offer(h, Event(change, table, row, route.text, depth, path))
+    return jobs
+
+
+def _walk(schema: Schema, route: Route, max_hops: int | None, change: Change, origin: Hop,
+          get, order: str):
+    """Yield (table, row, depth, path) for every row ``route`` reaches from the change."""
+    if order not in ("bfs", "dfs"):
+        raise ValueError(f"order must be 'bfs' or 'dfs', got {order!r}")
+    start = (change.table, change.key)
+    visited = {(change.table, change.key, 0)}
+
+    def expand(table: str, rows: list[dict], state: int, depth: int, path: tuple[Hop, ...]) -> list:
+        if max_hops is not None and depth >= max_hops:
+            return []
         out = []
-        tb = schema[table]
-        edges: list[ForeignKey] = tb.fks if direction == "up" else tb.refs
-        for fk in edges:
-            if direction == "up":
-                vals = tuple(row.get(c) for c in fk.child_cols)
-                target, cols = fk.parent, fk.parent_cols
-            else:
-                vals = tuple(row.get(c) for c in fk.parent_cols)
-                target, cols = fk.child, fk.child_cols
-            if depth + 1 > registry.slack(target, direction, change):
-                continue  # no handler at or beyond target can fire from this far away
-            if any(v is None for v in vals):
-                continue
-            for r in fetch(target, cols, vals):
-                k = schema[target].key_of(r)
-                out.append((target, r, depth + 1, direction, path + (Hop(target, k, fk.name),)))
+        for m in route.moves(state, table):
+            # leaving the changed row upward, use its old *and* new values, so a row
+            # that moved to another parent reaches both parents
+            for row in (rows if m.up else rows[:1]):
+                vals = tuple(row.get(c) for c in m.from_cols())
+                if any(v is None for v in vals):
+                    continue
+                for r in get(m.target, m.to_cols(), vals):
+                    k = schema[m.target].key_of(r)
+                    hop = Hop(m.target, k, f"{m.fk.child}.{','.join(m.fk.child_cols)}", r)
+                    out.append((m.target, r, m.state, depth + 1, path + (hop,)))
         return out
 
-    seeds = []
-    for r in (change.new, change.old):  # old *and* new: a row that moved parent notifies both
-        if r is not None:
-            seeds += expand(change.table, r, 0, "up", (origin,))
-    seeds += expand(change.table, change.row, 0, "down", (origin,))
+    first = [r for r in (change.new, change.old) if r is not None]
+    seeds = expand(change.table, first, 0, 0, (origin,))
 
-    def visit(node) -> list:
-        table, row, depth, direction, path = node
-        relation = "descendants" if direction == "up" else "ancestors"
-        for h in registry.matching(table, relation, change, depth):
-            jobs.append((h, Event(change, table, row, relation, depth, path)))  # type: ignore[arg-type]
-        return expand(table, row, depth, direction, path)
+    def key(n) -> tuple:
+        return (n[0], schema[n[0]].key_of(n[1]), n[2])
+
+    def emit(n):
+        table, row, state, depth, path = n
+        if route.accepts(state, table) and (table, path[-1].key) != start:
+            return (table, row, depth, path)
+        return None
 
     if order == "bfs":
+        frontier: deque = deque()
         for n in seeds:
-            k = (n[0], schema[n[0]].key_of(n[1]))
-            if k not in visited:
-                visited.add(k)
+            if key(n) not in visited:
+                visited.add(key(n))
                 frontier.append(n)
         while frontier:
-            for n in visit(frontier.popleft()):
-                k = (n[0], schema[n[0]].key_of(n[1]))
-                if k not in visited:
-                    visited.add(k)
-                    frontier.append(n)
-    elif order == "dfs":
+            n = frontier.popleft()
+            hit = emit(n)
+            if hit:
+                yield hit
+            for m in expand(n[0], [n[1]], n[2], n[3], n[4]):
+                if key(m) not in visited:
+                    visited.add(key(m))
+                    frontier.append(m)
+    else:
         stack = list(reversed(seeds))
         while stack:
             n = stack.pop()
-            k = (n[0], schema[n[0]].key_of(n[1]))
-            if k in visited:
+            if key(n) in visited:
                 continue
-            visited.add(k)
-            stack.extend(reversed(visit(n)))
-    else:
-        raise ValueError(f"order must be 'bfs' or 'dfs', got {order!r}")
-    return jobs
+            visited.add(key(n))
+            hit = emit(n)
+            if hit:
+                yield hit
+            stack.extend(reversed(expand(n[0], [n[1]], n[2], n[3], n[4])))

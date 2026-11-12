@@ -26,18 +26,20 @@ from brm.handlers import MQTT, when
 app = App("iot.db", schema="schema.sql")
 bus = MQTT("broker.local")
 
-# anything below a device changed -> MQTT ping on brm/device/<id>
-app.on("device", bus.publish("brm/device/{key}"), watch="descendants", retries=3)
+# a sensor or reading anywhere under a device changed -> MQTT ping on brm/device/<id>
+app.on("device", bus.publish("brm/device/{key}"), via=["sensor", "reading"], retries=3)
 
-# a new reading over its sensor's threshold (reading -> sensor is 1 hop)
-@app.on("sensor", watch="descendants", source="reading", ops="insert", depth=1)
+# a new reading of this sensor over its threshold; `where` runs in the write's
+# transaction, so readings under the threshold never queue a job
+@app.on("sensor", via="reading.sensor_id", ops="insert",
+        where=lambda ev: ev.row["max_value"] is not None
+                         and ev.change.new["value"] > ev.row["max_value"])
 def over_threshold(ev):
-    if ev.row["max_value"] is not None and ev.change.new["value"] > ev.row["max_value"]:
-        print("alert", ev.row, ev.change.new)
+    print("alert", ev.row, ev.change.new)  # ev.row: the sensor; ev.change.new: the reading
 
-# a device went offline -> every sensor below it hears about it (walk down)
-app.on("sensor", lambda ev: print("offline:", ev.row), watch="ancestors", source="device",
-       ops="update", where=lambda ev: ev.change.new["online"] == 0)
+# a device went offline -> every sensor below it hears about it (device is above: walks down)
+app.on("sensor", lambda ev: print("offline:", ev.row), via="device", ops="update",
+       where=lambda ev: ev.change.new["online"] == 0)
 ```
 
 ```sh
@@ -68,24 +70,25 @@ erDiagram
     c  ||--o{ d  : "d.c_id"
 ```
 
-Suppose row `c #7` is updated. brm walks out from it one FK hop at a time; each column below
-is one BFS level. Going **up**, it fires `watch="descendants"` handlers on the parents.
-Going **down**, it fires `watch="ancestors"` handlers on the children. Handlers on `c #7`
-itself are `watch="self"`.
+Suppose row `c #7` is updated. Handlers on `c` with no `via` fire on `c #7` itself.
+Handlers whose route **starts at `c`** are walked out along their foreign keys, one hop at a
+time; each column below is one BFS level. A handler on `a` with `via="c"` is reached going
+**up** (c → b1/b2 → a). A handler on `d` with `via="c"` is reached going **down** (c → d).
+The direction comes from the schema; you never state it.
 
 ```mermaid
 flowchart LR
-    C7(["c #7<br/>UPDATE<br/>fires watch=self"])
+    C7(["c #7<br/>UPDATE<br/>on('c')"])
 
-    subgraph D1 ["depth 1"]
-        B13["b1 #3<br/>fires watch=descendants"]
-        B25["b2 #5<br/>fires watch=descendants"]
-        D40["d #40<br/>fires watch=ancestors"]
-        D41["d #41<br/>fires watch=ancestors"]
+    subgraph D1 ["1 hop"]
+        B13["b1 #3<br/>on('b1', via='c')"]
+        B25["b2 #5<br/>on('b2', via='c')"]
+        D40["d #40<br/>on('d', via='c')"]
+        D41["d #41<br/>on('d', via='c')"]
     end
 
-    subgraph D2 ["depth 2"]
-        A1["a #1<br/>fires watch=descendants"]
+    subgraph D2 ["2 hops"]
+        A1["a #1<br/>on('a', via='c')"]
     end
 
     C7 -- "up: c.b1_id" --> B13
@@ -96,12 +99,13 @@ flowchart LR
     B25 -. "a #1 already visited:<br/>fires once per change" .-> A1
 ```
 
-- The two walks are separate. The up-walk never turns around to visit siblings: `b1 #3`'s
-  other `c` rows are not reached. The down-walk never climbs back up.
-- `depth=1` on a handler on `a` would not fire here, because `a #1` is 2 hops away.
-  `source="c"` or `ops="update"` narrow a handler further.
-- Branches with nothing listening are pruned before any row is fetched. If no table at or
-  past `a` has a reachable handler, `b1 #3 → a #1` is never looked up.
+- `via="c"` means any route from `c`. `a #1` is reached through both `b1` and `b2`, but
+  fires once. `via="c.b1_id > b1.a_id"` names one exact route, and walks only that one.
+- A bare-table route goes one way only, all up or all down. It never turns around to
+  `b1 #3`'s other `c` rows. To turn around on purpose, spell it out:
+  `on("c", via="c.b1_id > <c.b1_id")` is "the other `c` rows under the same `b1`".
+- Only routes that start at the changed table are walked, and only along their own foreign
+  keys. A change in a table nobody routes from costs no lookups at all.
 - If the update had moved `c #7` from `b1 #3` to `b1 #9`, both `b1 #3` and `b1 #9` would be
   visited.
 
@@ -158,27 +162,45 @@ Tables without a declared primary key are addressed by `rowid`.
 ## Handlers
 
 ```python
-app.on(table, fn=None, *, watch="self", ops=None, depth=None, source=None,
-       where=None, retries=0, backoff=0.5, name=None)
+app.on(table, fn=None, *, via=None, ops=None, where=None, max_hops=None,
+       retries=0, backoff=0.5, name=None)
 ```
 
-| `watch` | fires on a row of `table` when… | walk |
-|---|---|---|
-| `"self"` | that row was inserted, updated or deleted | none |
-| `"descendants"` | a row that references it, directly or transitively, changed | up the FKs, child → parent |
-| `"ancestors"` | a row it references, directly or transitively, changed | down the FKs, parent → children |
+`via` says **where the change comes from**, using the schema's own foreign keys. It is
+written from the changed table to the handler's table:
 
-Pass a list to combine them. `ops` limits which operations count (`"insert"`, `"update"`,
-`"delete"`), and applies to the row that changed. `depth` is the maximum number of FK hops
-between the changed row and the handler's row. `source` limits the handler to changes in
-the given tables. `where(event)` is a predicate checked at dispatch time.
+| `via` | fires on a row of `table` when… |
+|---|---|
+| `None` | that row itself was inserted, updated or deleted |
+| `"reading"` | a related `reading` changed, by any route (all up or all down; brm works out which) |
+| `"reading.sensor_id"` | a `reading` changed that points at this row through exactly that key |
+| `"reading.sensor_id > sensor.device_id"` | a `reading` changed, related through exactly this path |
+| `"device > sensor.device_id"` | a path that starts by going down: a leading table names the start |
+| `"node.parent*"` / `"<node.parent*"` | self-reference repeated: every ancestor / every descendant node |
+| `"sensor.device_id > <sensor.device_id"` | up then back down: the other sensors on the same device |
+| `["sensor", "reading"]` | several routes, one registration each |
+
+Each hop names a foreign key by its child side, as `table.column` (`table.a,b` for a
+composite key). brm decides whether each hop goes up (child → parent) or down
+(parent → children) from where the path currently is. A leading `<` forces a hop down,
+which only matters for self-references. **Routes are checked against the schema when you
+register them**, so a schema change that breaks a route fails at startup, with the reason,
+instead of silently never firing.
+
+- `ops` limits which operations of the changed row count: `"insert"`, `"update"` or
+  `"delete"`.
+- `where(event)` runs **inside the write's transaction**, so events it rejects are never
+  queued. Keep it fast and free of side effects. If it raises, the error is logged and the
+  job is queued anyway.
+- `max_hops` caps a walk, which is mostly useful with `*`.
 
 A handler receives an `Event`:
 
 - `ev.table`, `ev.row`, `ev.key`: the row the handler is registered on.
-- `ev.relation`: `"self"`, `"descendants"` or `"ancestors"`.
-- `ev.depth`: number of FK hops from the changed row.
-- `ev.path`: the `Hop(table, key, via_fk)` list from the changed row to this one.
+- `ev.via`: the route that reached it, or `None` for the row itself. `ev.depth` is the
+  number of hops walked.
+- `ev.path`: every `Hop(table, key, via, row)` from the changed row (`path[0]`) to this one.
+  `ev.at("sensor")` returns the sensor on the way.
 - `ev.change`: the change itself, with `table`, `op`, `key`, `old`, `new`, `.row` and
   `.changed` (the set of columns that changed).
 
@@ -211,8 +233,8 @@ Order: with the default `concurrency=1`, jobs start in commit order, and in walk
 within a change. A job waiting to retry is overtaken by the jobs behind it. Sync handlers run
 in a thread pool, and `async def` handlers are awaited.
 
-**Handler names identify jobs across restarts.** A name defaults to `"<table>:<function name>"`,
-and must be unique (pass `name=` to tell two handlers apart). Renaming a handler leaves
+**Handler names identify jobs across restarts.** A name defaults to
+`"<table>:<function name>"`, plus `"@<route>"` when there is a `via`, and must be unique (pass `name=` to tell two handlers apart). Renaming a handler leaves
 any jobs still queued under the old name waiting. Drain the queue first, or clear them with
 `app.outbox.purge("pending", handler=old_name)`.
 
@@ -224,13 +246,14 @@ running the handlers to the others.
 
 How the walk behaves:
 
-- Each related row is visited once per change, along the first path found. With
+- Each related row is reached once per route per change, along the first path found. With
   `App(order="bfs")` (the default) that path is the shortest one; `order="dfs"` goes depth
   first.
 - Diamonds and cycles, including self-referencing tables, are safe.
+- The changed row is never reached through its own route.
 - When an update moves a row to a new parent, both the old and the new parent hear about it.
-- The walk only follows an FK edge if some handler at or beyond that table could still fire
-  within its `depth`, so no lookups happen when nothing is listening.
+- Lookups are shared between routes within a change, so the same row is never fetched
+  twice.
 
 A handler may write to the database itself; its writes are new changes. Avoid handlers that
 trigger each other forever.
@@ -250,7 +273,7 @@ shows the queue.
 - Combinators: `when(pred, fn)`, `fanout(f, g, ...)`, `changed("col", ...)` and
   `matches(col=value)`.
 
-Topic and URL templates can use `{table} {key} {op} {relation} {depth} {source} {source_key}`.
+Topic and URL templates can use `{table} {key} {op} {via} {depth} {source} {source_key}`.
 The default payload is the event as JSON.
 
 ## Schema rules
@@ -262,8 +285,8 @@ The default payload is the event as JSON.
   lock, which suits SQLite's single writer. Tables named `_brm_*` belong to brm and are
   left out of the API and the schema check.
 - Changes made outside brm, such as from the `sqlite3` shell, by `ON DELETE CASCADE`, or by
-  SQL triggers, do not fire handlers. Cascaded rows are reached by an `"ancestors"` walk
-  from the row deleted through brm.
+  SQL triggers, do not fire handlers. Cascaded rows are reached by a downward route,
+  such as `on("reading", via="device")`, from the row deleted through brm.
 
 ## Development
 

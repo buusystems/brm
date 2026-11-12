@@ -302,13 +302,12 @@ class Dispatcher:
             await db(self.outbox.bury, f"lease expired {job.reclaims} times (dispatcher died mid-run)")
             return
         try:
-            if h.where is None or h.where(ev):
-                if inspect.iscoroutinefunction(h.fn):
-                    await h.fn(ev)
-                else:
-                    res = await loop.run_in_executor(None, h.fn, ev)
-                    if inspect.isawaitable(res):
-                        await res
+            if inspect.iscoroutinefunction(h.fn):
+                await h.fn(ev)
+            else:
+                res = await loop.run_in_executor(None, h.fn, ev)
+                if inspect.isawaitable(res):
+                    await res
         except Exception as e:  # noqa: BLE001 - handler errors must not kill the worker
             err = f"{type(e).__name__}: {e}"
             errors = job.errors + 1

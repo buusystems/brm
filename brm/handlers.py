@@ -19,7 +19,7 @@ def _fields(ev: Event) -> dict[str, Any]:
     return {
         "table": ev.table,
         "key": ",".join(str(k) for k in ev.key),
-        "relation": ev.relation,
+        "via": ev.via or "",
         "depth": ev.depth,
         "op": ev.change.op,
         "source": ev.change.table,
@@ -81,7 +81,7 @@ def log(level: int = logging.INFO, logger: logging.Logger | None = None) -> Call
     def log_event(ev: Event) -> None:
         f = _fields(ev)
         lg.log(level, "%s %s.%s -> %s %s (%s, depth %d)", f["op"], f["source"], f["source_key"],
-               f["table"], f["key"], f["relation"], f["depth"])
+               f["table"], f["key"], f["via"] or "self", f["depth"])
     return log_event
 
 
@@ -97,7 +97,7 @@ def collect(into: list) -> Callable[[Event], None]:
 
 def webhook(url: str, *, method: str = "POST", headers: dict[str, str] | None = None,
             timeout: float = 10, body: Callable[[Event], str] = to_json) -> Callable[[Event], None]:
-    """HTTP request per event; ``url`` may use {table} {key} {op} {relation} {source} fields.
+    """HTTP request per event; ``url`` may use {table} {key} {op} {via} {source} fields.
     Non-2xx raises, so ``retries`` on the registration applies."""
     hdrs = {"Content-Type": "application/json", **(headers or {})}
 
@@ -113,7 +113,7 @@ class MQTT:
     """A lazily connected paho-mqtt client shared by any number of ``publish`` handlers.
 
     >>> bus = MQTT("broker.local")
-    >>> app.on("device", bus.publish("alerts/{table}/{key}"), watch="descendants")
+    >>> app.on("device", bus.publish("alerts/{table}/{key}"), via="reading")
     """
 
     def __init__(self, host: str = "localhost", port: int = 1883, *, client_id: str = "",
@@ -144,7 +144,7 @@ class MQTT:
     def publish(self, topic: str = "brm/{table}/{key}", *, qos: int = 1, retain: bool = False,
                 payload: Callable[[Event], str | bytes] = to_json) -> Callable[[Event], None]:
         """Handler publishing ``payload(event)`` to ``topic`` (formatted with
-        {table} {key} {op} {relation} {depth} {source} {source_key}). Waits for the
+        {table} {key} {op} {via} {depth} {source} {source_key}). Waits for the
         broker to accept it, so failures raise and ``retries`` apply."""
 
         def mqtt_publish(ev: Event) -> None:

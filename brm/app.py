@@ -21,7 +21,7 @@ class App:
     """Best Relational Model.
 
     >>> app = App("app.db", schema="schema.sql")
-    >>> @app.on("device", watch="descendants", ops="insert", source="reading")
+    >>> @app.on("device", via="reading", ops="insert")
     ... def new_reading(ev): print(ev.row["name"], ev.change.new)
     >>> # uvicorn mymodule:app   (an App is an ASGI app)
 
@@ -74,48 +74,62 @@ class App:
         table: str,
         fn: HandlerFn | None = None,
         *,
-        watch: str | Iterable[str] = "self",
+        via: str | Iterable[str] | None = None,
         ops: str | Iterable[str] | None = None,
-        depth: int | None = None,
-        source: str | Iterable[str] | None = None,
         where: Callable[[Event], bool] | None = None,
+        max_hops: int | None = None,
         retries: int = 0,
         backoff: float = 0.5,
         name: str | None = None,
     ):
         """Register ``fn(event)`` on rows of ``table``.
 
-        watch   "self"        a row of ``table`` was inserted/updated/deleted
-                "descendants" a row referencing a ``table`` row (transitively) changed
-                "ancestors"   a row a ``table`` row references (transitively) changed
-                (any combination, as a list)
-        ops     restrict to "insert" / "update" / "delete" (of the changed row)
-        depth   max foreign-key hops between the changed row and ``table``'s row
-        source  only changes to these tables
-        where   predicate on the Event, checked at dispatch time
-        retries extra attempts on exception, waiting backoff * 2**n between them
-        name    stable id for queued jobs (default "<table>:<function name>"); jobs
-                survive restarts by name, so rename a handler only after draining it
+        via      where the change comes from, by foreign keys (see brm.routes):
+                   None                        the handler's own rows changed
+                   "reading"                   a reading anywhere related (any route)
+                   "reading.sensor_id"         a reading through exactly this key
+                   "reading.sensor_id > sensor.device_id"   exactly this path
+                   ["sensor", "reading"]       several routes (one registration each;
+                                               a given name= gets "@<route>" appended)
+                 Up or down is worked out from the schema; the route is checked now.
+        ops      "insert" / "update" / "delete" of the changed row (default all)
+        where    predicate on the Event, run in the write's transaction: events it
+                 rejects are never queued. Keep it fast and side-effect free.
+        max_hops cap on hops walked; for self-references like "node.parent*"
+        retries  extra attempts on exception, waiting backoff * 2**n between them
+        name     stable id for queued jobs (default "<table>:<function>[@<via>]");
+                 jobs survive restarts by name, so rename only after draining
 
         Use as ``@app.on(...)`` or ``app.on(table, fn, ...)``; returns ``fn``.
         """
+        vias = [via] if via is None or isinstance(via, str) else list(via)
+        if not vias:
+            raise ValueError("via is an empty list")
+        routes = [None if v is None else self.registry.route(table, v) for v in vias]
 
         def register(f: HandlerFn) -> HandlerFn:
+            for route in routes:
+                _register(f, route, name if len(routes) == 1 or name is None
+                          else f"{name}@{route.text}")  # type: ignore[union-attr]
+            return f
+
+        def _register(f: HandlerFn, route, name: str | None) -> None:
+            default = f"{table}:{getattr(f, '__name__', type(f).__name__)}"
+            if route is not None:
+                default += f"@{route.text}"
             h = Handler(
                 fn=f,
                 table=table,
-                watch=_set(watch, None) or frozenset(("self",)),
+                route=route,
                 ops=_set(ops, OPS) or OPS,
-                depth=depth,
-                source=_set(source, None),
+                max_hops=max_hops,
                 where=where,
                 retries=retries,
                 backoff=backoff,
-                name=name or f"{table}:{getattr(f, '__name__', type(f).__name__)}",
+                name=name or default,
             )
             self.registry.add(h)
             self._by_fn.setdefault(f, []).append(h)
-            return f
 
         return register if fn is None else register(fn)
 

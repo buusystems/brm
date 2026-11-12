@@ -42,7 +42,7 @@ def tree(app):
 
 
 def seen(events):
-    return [(e.table, e.key, e.relation, e.depth) for e in events]
+    return [(e.table, e.key, e.via, e.depth) for e in events]
 
 
 # -- schema ----------------------------------------------------------------------
@@ -72,10 +72,10 @@ def test_composite_and_rowid_and_implicit_reference():
     assert row == {"rowid": 1, "n": "hi"}
     a.insert("a", x=1, y="k")
     ev = []
-    a.on("a", collect(ev), watch="descendants")
+    a.on("a", collect(ev), via="b.x,y")  # composite foreign key
     a.insert("b", x=1, y="k", note="n")
     a.drain()
-    assert seen(ev) == [("a", (1, "k"), "descendants", 1)]
+    assert seen(ev) == [("a", (1, "k"), "b > b.x,y", 1)]
     c = TestClient(a)
     assert c.get("/a/1,k").json() == {"x": 1, "y": "k"}
     assert c.get("/c/1").json() == {"rowid": 1, "n": "hi"}
@@ -140,82 +140,133 @@ def test_self(tree):
     tree.update("sensor", 2, max_value=50)
     tree.update("sensor", 2, max_value=50)  # no-op: no event
     tree.drain()
-    assert seen(ev) == [("sensor", (2,), "self", 0)]
+    assert seen(ev) == [("sensor", (2,), None, 0)]
     assert ev[0].change.old["max_value"] is None and ev[0].change.new["max_value"] == 50
     assert ev[0].change.changed == {"max_value"}
 
 
-def test_descendants_walks_up(tree):
+def test_any_route_up(tree):
     ev = []
     for t in ("sensor", "device", "site"):
-        tree.on(t, collect(ev), watch="descendants")
+        tree.on(t, collect(ev), via="reading")
     tree.insert("reading", sensor_id=1, value=25)
     tree.drain()
-    assert seen(ev) == [("sensor", (1,), "descendants", 1),
-                        ("device", (1,), "descendants", 2),
-                        ("site", (1,), "descendants", 3)]
+    assert seen(ev) == [("sensor", (1,), "reading", 1),
+                        ("device", (1,), "reading", 2),
+                        ("site", (1,), "reading", 3)]
     assert [h.table for h in ev[2].path] == ["reading", "sensor", "device", "site"]
+    assert ev[2].at("sensor")["kind"] == "temp" and ev[2].at("reading")["value"] == 25
     assert ev[2].change.table == "reading"
 
 
-def test_depth_and_source_and_ops(tree):
+def test_exact_paths_and_ops(tree):
     ev = []
-    tree.on("site", collect(ev), watch="descendants", depth=2)  # sensors and devices only
-    tree.on("device", collect(ev), watch="descendants", source="reading", ops="delete")
-    tree.insert("reading", sensor_id=1, value=1)  # site is 3 hops away: no
-    tree.insert("sensor", device_id=2, kind="x")  # site 2 hops: yes; device: wrong source
-    tree.delete("reading", 1)  # site: 3 hops no; device: yes
+    tree.on("device", collect(ev), via="reading.sensor_id > sensor.device_id", ops="delete")
+    tree.on("device", collect(ev), via="sensor.device_id", name="direct")  # sensors, not readings
+    tree.insert("reading", sensor_id=1, value=1)  # neither: insert, and not a sensor
+    tree.insert("sensor", device_id=2, kind="x")  # direct
+    tree.delete("reading", 1)  # path
     tree.drain()
-    assert seen(ev) == [("site", (1,), "descendants", 2), ("device", (1,), "descendants", 2)]
+    assert seen(ev) == [("device", (2,), "sensor > sensor.device_id", 1),
+                        ("device", (1,), "reading > reading.sensor_id > sensor.device_id", 2)]
 
 
-def test_ancestors_walks_down(tree):
+def test_threshold_example(tree):
+    alerts = []
+    tree.on("sensor", lambda e: alerts.append(e.change.new["value"]), via="reading.sensor_id",
+            ops="insert", name="over",
+            where=lambda e: e.row["max_value"] is not None and e.change.new["value"] > e.row["max_value"])
+    for v in (10, 31, 29, 45):
+        tree.insert("reading", sensor_id=1, value=v)
+    tree.insert("reading", sensor_id=2, value=99)  # sensor 2 has no threshold
+    tree.drain()
+    assert alerts == [31, 45]
+
+
+def test_where_filters_before_queueing(tree):
+    tree.dispatcher.stop()
+    tree.on("sensor", lambda e: None, where=lambda e: e.row["kind"] == "temp", name="w")
+    tree.on("site", lambda e: None, where=lambda e: 1 / 0, name="broken")  # fails open
+    tree.update("sensor", 2, max_value=1)  # hum: filtered, never queued
+    tree.update("sensor", 1, max_value=1)
+    tree.update("site", 1, name="q")
+    assert tree.outbox.stats()["handlers"] == {"w": {"pending": 1}, "broken": {"pending": 1}}
+    tree.dispatcher.start()
+
+
+def test_any_route_down(tree):
     ev = []
-    tree.on("sensor", collect(ev), watch="ancestors")
-    tree.on("reading", collect(ev), watch="ancestors", depth=2)
+    tree.on("sensor", collect(ev), via="device")
+    tree.on("sensor", collect(ev), via="site", name="from-site")
+    tree.on("reading", collect(ev), via="site", max_hops=2)  # readings are 3 below a site
     tree.update("device", 1, online=False)
     tree.update("site", 1, name="lab2")
     tree.drain()
     assert seen(ev) == [
-        ("sensor", (1,), "ancestors", 1), ("sensor", (2,), "ancestors", 1),
-        ("reading", (1,), "ancestors", 2),
-        ("sensor", (1,), "ancestors", 2), ("sensor", (2,), "ancestors", 2),  # reading is 3 below site
+        ("sensor", (1,), "device", 1), ("sensor", (2,), "device", 1),
+        ("sensor", (1,), "site", 2), ("sensor", (2,), "site", 2),
     ]
+
+
+def test_siblings_up_then_down(tree):
+    ev = []
+    tree.on("sensor", collect(ev), via="sensor.device_id > <sensor.device_id")
+    tree.update("sensor", 1, kind="t")
+    tree.drain()
+    assert seen(ev) == [("sensor", (2,), "sensor > sensor.device_id > <sensor.device_id", 2)]
+
+
+def test_route_errors(app):
+    from brm import RouteError
+    bad = [
+        ("device", "reading.value", "no foreign key on"),
+        ("device", "nope", "unknown table"),
+        ("device", "device", "leave via out"),
+        ("sensor", "reading.sensor_id > sensor.device_id", "ends at 'device'"),
+        ("site", "reading.sensor_id > device.site_id", "path is at 'sensor'"),
+        ("sensor", "sensor.device_id*", "self-referencing key only"),
+    ]
+    for table, via, msg in bad:
+        with pytest.raises(RouteError, match=msg):
+            app.on(table, lambda e: None, via=via)
+    a = App(schema="CREATE TABLE x (id INTEGER PRIMARY KEY); CREATE TABLE y (id INTEGER PRIMARY KEY);")
+    with pytest.raises(RouteError, match="no chain"):
+        a.on("x", lambda e: None, via="y")
+    a.close()
 
 
 def test_delete_cascade_is_walked_before_delete(tree):
     ev = []
-    tree.on("reading", collect(ev), watch="ancestors")
-    tree.on("sensor", collect(ev), watch=["self", "ancestors"])
+    tree.on("reading", collect(ev), via="device")
+    tree.on("sensor", collect(ev))
+    tree.on("sensor", collect(ev), via="device", name="sensor-down")
     tree.delete("device", 1)
     tree.drain()
-    assert seen(ev) == [("sensor", (1,), "ancestors", 1), ("sensor", (2,), "ancestors", 1),
-                        ("reading", (1,), "ancestors", 2)]
+    assert seen(ev) == [("reading", (1,), "device", 2),
+                        ("sensor", (1,), "device", 1), ("sensor", (2,), "device", 1)]
     assert tree.select("sensor") == [] and tree.select("reading") == []
 
 
 def test_moving_a_row_notifies_old_and_new_parent(tree):
     ev = []
-    tree.on("device", collect(ev), watch="descendants")
+    tree.on("device", collect(ev), via="sensor")
     tree.update("sensor", 2, device_id=2)
     tree.drain()
-    assert sorted(seen(ev)) == [("device", (1,), "descendants", 1), ("device", (2,), "descendants", 1)]
+    assert sorted(seen(ev)) == [("device", (1,), "sensor", 1), ("device", (2,), "sensor", 1)]
 
 
 def test_bfs_vs_dfs_order():
-    ddl = IOT
-    for order, want in [("bfs", ["d1", "d2", "s1", "s2", "s3"]), ("dfs", ["d1", "s1", "s2", "d2", "s3"])]:
-        a = App(schema=ddl, order=order)
-        a.insert("site", name="x")
-        a.insert("device", site_id=1, name="d1")
-        a.insert("device", site_id=1, name="d2")
-        a.insert("sensor", device_id=1, kind="s1")
-        a.insert("sensor", device_id=1, kind="s2")
-        a.insert("sensor", device_id=2, kind="s3")
+    for order, want in [("bfs", ["s1", "s2", "s3", "r1", "r2", "r3"]),
+                        ("dfs", ["s1", "r1", "r2", "s2", "s3", "r3"])]:
+        a = App(schema="""
+            CREATE TABLE n (id INTEGER PRIMARY KEY, name TEXT, parent INT REFERENCES n(id));
+        """, order=order)
+        a.insert("n", name="root")
+        for name, parent in [("s1", 1), ("s2", 1), ("s3", 1), ("r1", 2), ("r2", 2), ("r3", 4)]:
+            a.insert("n", name=name, parent=parent)
         names = []
-        a.on("device", lambda e: names.append(e.row["name"]), watch="ancestors")
-        a.on("sensor", lambda e: names.append(e.row["kind"]), watch="ancestors")
-        a.update("site", 1, name="y")
+        a.on("n", lambda e: names.append(e.row["name"]), via="<n.parent*")
+        a.update("n", 1, name="root2")
         a.drain()
         assert names == want, order
         a.close()
@@ -233,7 +284,8 @@ def test_diamond_and_cycle_visit_once():
     a.insert("l", top_id=1)
     a.insert("r", top_id=1)
     ev = []
-    a.on("top", collect(ev), watch="descendants")
+    a.on("top", collect(ev), via="leaf")  # two routes, one event
+    a.on("top", collect(ev), via="leaf.r_id > r.top_id", name="right-only")
     a.insert("leaf", l_id=1, r_id=1)
     # self-referencing cycle: 1 -> 2 -> 3 -> 1
     a.insert("node", id=1)
@@ -241,13 +293,16 @@ def test_diamond_and_cycle_visit_once():
     a.insert("node", id=3, parent=2)
     a.update("node", 1, parent=3)
     a.drain()
-    assert seen(ev) == [("top", (1,), "descendants", 2)]
+    assert sorted(seen(ev)) == [("top", (1,), "leaf", 2), ("top", (1,), "leaf > leaf.r_id > r.top_id", 2)]
+    assert [h.table for h in ev[0].path][1] in ("l", "r")
     ev.clear()
-    a.on("node", collect(ev), watch="descendants")
+    a.on("node", collect(ev), via="node.parent*")
+    a.on("node", collect(ev), via="node.parent*", max_hops=2, name="near")
     a.insert("node", id=4, parent=1)
     a.drain()
-    assert seen(ev) == [("node", (1,), "descendants", 1), ("node", (3,), "descendants", 2),
-                        ("node", (2,), "descendants", 3)]
+    v = "node > node.parent*"
+    assert seen(ev) == [("node", (1,), v, 1), ("node", (3,), v, 2), ("node", (2,), v, 3),  # all
+                        ("node", (1,), v, 1), ("node", (3,), v, 2)]  # max_hops=2
     a.close()
 
 
@@ -333,8 +388,8 @@ def test_no_walk_without_handlers(tree, monkeypatch):
     real = st.Tx._fetch
     monkeypatch.setattr(st.Tx, "_fetch", lambda self, *a: fetched.append(a) or real(self, *a))
     tree.on("reading", lambda e: None)  # self only: nothing to walk
-    tree.on("device", lambda e: None, watch="descendants", depth=1)
-    tree.insert("reading", sensor_id=1, value=2)  # device is 2 hops up: pruned
+    tree.on("device", lambda e: None, via="sensor.device_id")
+    tree.insert("reading", sensor_id=1, value=2)  # no route starts at reading: no lookups
     assert fetched == []
     tree.insert("sensor", device_id=1, kind="x")  # device 1 hop up: one lookup
     assert fetched == [("device", ("id",), (1,))]
@@ -342,11 +397,11 @@ def test_no_walk_without_handlers(tree, monkeypatch):
 
 def test_http_writes_fire_hooks(tree):
     ev = []
-    tree.on("device", collect(ev), watch="descendants", source="reading")
+    tree.on("device", collect(ev), via="reading")
     with TestClient(tree) as c:
         c.post("/reading", json={"sensor_id": 2, "value": 9})
         tree.drain()
-    assert seen(ev) == [("device", (1,), "descendants", 2)]
+    assert seen(ev) == [("device", (1,), "reading", 2)]
 
 
 def test_threads(tmp_path):
@@ -355,7 +410,7 @@ def test_threads(tmp_path):
     a.insert("device", site_id=1, name="d")
     a.insert("sensor", device_id=1, kind="k")
     n = []
-    a.on("site", lambda e: n.append(1), watch="descendants")
+    a.on("site", lambda e: n.append(1), via="reading")
 
     def work():
         for i in range(50):
@@ -385,15 +440,14 @@ def test_mqtt_publish_handler(tree):
 
     bus = MQTT("nowhere")
     bus._client = FakeClient()
-    tree.on("device", bus.publish("alerts/{table}/{key}/{op}/{source}"), watch="descendants",
-            source="reading")
+    tree.on("device", bus.publish("alerts/{table}/{key}/{op}/{source}"), via="reading")
     tree.insert("reading", sensor_id=2, value=7)
     tree.drain()
     import json
     [(topic, payload, qos)] = FakeClient.sent
     assert topic == "alerts/device/1/insert/reading" and qos == 1
     body = json.loads(payload)
-    assert body["change"]["new"]["value"] == 7 and body["relation"] == "descendants"
+    assert body["change"]["new"]["value"] == 7 and body["via"] == "reading"
 
 
 # -- durable outbox ----------------------------------------------------------------------
@@ -402,7 +456,7 @@ def test_mqtt_publish_handler(tree):
 def test_jobs_survive_a_restart(tmp_path):
     p = str(tmp_path / "d.db")
     a = App(p, schema=IOT, dispatch=False)  # writer only: nothing runs here
-    a.on("site", lambda e: None, watch="descendants", name="ping")
+    a.on("site", lambda e: None, via="device", name="ping")
     a.insert("site", name="s")
     a.insert("device", site_id=1, name="d")
     assert a.outbox.stats()["pending"] == 1
@@ -410,9 +464,9 @@ def test_jobs_survive_a_restart(tmp_path):
 
     got = []
     b = App(p, schema=IOT)
-    b.on("site", collect(got), watch="descendants", name="ping")
+    b.on("site", collect(got), via="device", name="ping")
     assert b.drain(5)
-    assert seen(got) == [("site", (1,), "descendants", 1)]
+    assert seen(got) == [("site", (1,), "device", 1)]
     assert got[0].change.new == {"id": 1, "site_id": 1, "name": "d", "online": 1}
     assert b.outbox.stats()["pending"] == 0
     b.close()
@@ -522,8 +576,8 @@ def test_handler_names_are_unique(app):
     def f(e): pass
     app.on("site", f)
     with pytest.raises(ValueError, match="already registered"):
-        app.on("site", f, watch="descendants")
-    app.on("site", f, watch="descendants", name="site:f:desc")
+        app.on("site", f, ops="insert")
+    app.on("site", f, via="device")  # the route is part of the default name
 
 
 def test_blob_round_trip():
@@ -534,3 +588,28 @@ def test_blob_round_trip():
     a.drain()
     assert got[0].row["data"] == b"\x00\xff"
     a.close()
+
+
+def test_via_list_registers_each_route(tree):
+    ev = []
+    tree.on("site", collect(ev), via=["device", "reading"], name="under")
+    assert {h.name for h in tree.handlers} == {"under@device", "under@reading"}
+    tree.insert("reading", sensor_id=1, value=3)
+    tree.update("device", 2, name="z")
+    tree.drain()
+    assert seen(ev) == [("site", (1,), "reading", 3), ("site", (1,), "device", 1)]
+
+
+def test_example_app_loads(tmp_path, monkeypatch):
+    import importlib
+    monkeypatch.setenv("BRM_DB", str(tmp_path / "iot.db"))
+    monkeypatch.delenv("BRM_MQTT", raising=False)
+    mod = importlib.import_module("examples.iot.app")
+    c = TestClient(mod.app)
+    c.post("/site", json={"name": "s"})
+    c.post("/device", json={"site_id": 1, "name": "d"})
+    c.post("/sensor", json={"device_id": 1, "kind": "temp", "max_value": 30})
+    c.post("/reading", json={"sensor_id": 1, "value": 12})
+    c.post("/reading", json={"sensor_id": 1, "value": 40})
+    assert mod.app.drain(5)
+    mod.app.close()
