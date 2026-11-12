@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "brm"
+version = "0.1.0"
+description = "Best Relational Model: SQL schema in, CRUD API and foreign-key-aware change hooks out"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = ["fastapi>=0.110", "uvicorn>=0.27"]
+
+[project.optional-dependencies]
+mqtt = ["paho-mqtt>=2.0"]
+dev = ["pytest>=8", "httpx>=0.27", "paho-mqtt>=2.0"]
+
+[tool.setuptools]
+packages = ["brm"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
