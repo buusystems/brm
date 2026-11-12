@@ -45,6 +45,86 @@ pip install -e '.[mqtt]'
 uvicorn app:app          # an App is an ASGI app; or mount app.router() in your own FastAPI
 ```
 
+## How propagation works
+
+A generic schema. Every table `x` that holds a foreign key to `y` is a *child* of `y`.
+`c` references both `b1` and `b2` (a diamond), and `d` hangs below `c`. The same shape
+continues to any depth or width.
+
+```sql
+CREATE TABLE a  (id INTEGER PRIMARY KEY);
+CREATE TABLE b1 (id INTEGER PRIMARY KEY, a_id  INT REFERENCES a(id));
+CREATE TABLE b2 (id INTEGER PRIMARY KEY, a_id  INT REFERENCES a(id));
+CREATE TABLE c  (id INTEGER PRIMARY KEY, b1_id INT REFERENCES b1(id), b2_id INT REFERENCES b2(id));
+CREATE TABLE d  (id INTEGER PRIMARY KEY, c_id  INT REFERENCES c(id));
+```
+
+```mermaid
+erDiagram
+    a  ||--o{ b1 : "b1.a_id"
+    a  ||--o{ b2 : "b2.a_id"
+    b1 ||--o{ c  : "c.b1_id"
+    b2 ||--o{ c  : "c.b2_id"
+    c  ||--o{ d  : "d.c_id"
+```
+
+Suppose row `c #7` is updated. brm walks out from it one FK hop at a time; each column below
+is one BFS level. Going **up**, it fires `watch="descendants"` handlers on the parents.
+Going **down**, it fires `watch="ancestors"` handlers on the children. Handlers on `c #7`
+itself are `watch="self"`.
+
+```mermaid
+flowchart LR
+    C7(["c #7<br/>UPDATE<br/>fires watch=self"])
+
+    subgraph D1 ["depth 1"]
+        B13["b1 #3<br/>fires watch=descendants"]
+        B25["b2 #5<br/>fires watch=descendants"]
+        D40["d #40<br/>fires watch=ancestors"]
+        D41["d #41<br/>fires watch=ancestors"]
+    end
+
+    subgraph D2 ["depth 2"]
+        A1["a #1<br/>fires watch=descendants"]
+    end
+
+    C7 -- "up: c.b1_id" --> B13
+    C7 -- "up: c.b2_id" --> B25
+    C7 -- "down: d.c_id" --> D40
+    C7 -- "down: d.c_id" --> D41
+    B13 -- "up: b1.a_id" --> A1
+    B25 -. "a #1 already visited:<br/>fires once per change" .-> A1
+```
+
+- The two walks are separate. The up-walk never turns around to visit siblings: `b1 #3`'s
+  other `c` rows are not reached. The down-walk never climbs back up.
+- `depth=1` on a handler on `a` would not fire here, because `a #1` is 2 hops away.
+  `source="c"` or `ops="update"` narrow a handler further.
+- Branches with nothing listening are pruned before any row is fetched. If no table at or
+  past `a` has a reachable handler, `b1 #3 → a #1` is never looked up.
+- If the update had moved `c #7` from `b1 #3` to `b1 #9`, both `b1 #3` and `b1 #9` would be
+  visited.
+
+When it happens, relative to the write:
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant API as brm (FastAPI)
+    participant DB as SQLite transaction
+    participant Q as Dispatcher (background loop)
+    participant H as Handlers (MQTT, webhook, ...)
+    Client->>API: PATCH /c/7
+    API->>DB: BEGIN, UPDATE c
+    API->>DB: walk FK graph (SELECTs), list (handler, event) jobs
+    API->>DB: COMMIT
+    API-->>Client: 200 (does not wait for handlers)
+    API->>Q: submit jobs (dropped if the transaction rolled back)
+    loop walk order (BFS or DFS)
+        Q->>H: fn(event), retried with backoff on error
+    end
+```
+
 ## Routes
 
 For each table `t` with primary key `k`:
